@@ -1,10 +1,22 @@
 from torch import nn
-from torch.utils import model_zoo
-from torchvision.models.resnet import BasicBlock, model_urls, Bottleneck
-import torch
-import math
-from torch import nn as nn
+from torchvision.models.resnet import BasicBlock, Bottleneck
 from utils.util import *
+
+
+def _load_pretrained_state_dict(arch):
+    try:
+        from torchvision.models import resnet18 as tv_resnet18, resnet50 as tv_resnet50
+        from torchvision.models import ResNet18_Weights, ResNet50_Weights
+        loaders = {
+            'resnet18': (tv_resnet18, ResNet18_Weights.IMAGENET1K_V1),
+            'resnet50': (tv_resnet50, ResNet50_Weights.IMAGENET1K_V1),
+        }
+        model_fn, weights = loaders[arch]
+        return model_fn(weights=weights).state_dict()
+    except (ImportError, AttributeError):
+        from torch.utils import model_zoo
+        from torchvision.models.resnet import model_urls
+        return model_zoo.load_url(model_urls[arch])
 
 
 class ResNet(nn.Module):
@@ -89,7 +101,7 @@ def resnet18(pretrained=True, **kwargs):
     """
     model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
     if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet18']), strict=False)
+        model.load_state_dict(_load_pretrained_state_dict('resnet18'), strict=False)
     return model
 
 def resnet50(pretrained=True, **kwargs):
@@ -99,5 +111,5 @@ def resnet50(pretrained=True, **kwargs):
     """
     model = ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
     if pretrained:
-        model.load_state_dict(model_zoo.load_url(model_urls['resnet50']), strict=False)
+        model.load_state_dict(_load_pretrained_state_dict('resnet50'), strict=False)
     return model

@@ -1,0 +1,37 @@
+# Ignore dataset folder
+data/
+DeepCore/
+checkpoints/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+env/
+
+.idea
+
+*.tar
+*.pth.tar
+*.png
+*.pth
+*.pt
+
+*.csv
+*.png
+*.pth
+*.pth.tar
+*.tar
+*.txt
+*.log
+*.json
+*.yaml
+*.yml
+*.jsonl
+*.jsonl.gz
+*.jsonl.bz2
+
+*ploting.py
