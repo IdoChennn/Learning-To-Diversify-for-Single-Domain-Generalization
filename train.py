@@ -56,6 +56,10 @@ def get_args():
     parser.add_argument("--beta", default=0.1, type=float)
     parser.add_argument("--lr_sc", default=10, type=float)
     parser.add_argument("--task", default='PACS', type=str)
+    parser.add_argument("--data_backend", choices=['auto', 'files', 'hf'], default='auto',
+                        help="auto: PACS is loaded via HuggingFace datasets (auto-download/cache), "
+                             "other tasks use local image files. 'hf' forces HuggingFace, "
+                             "'files' forces the local txt-list/image-folder pipeline.")
 
     return parser.parse_args()
 

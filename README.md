@@ -15,12 +15,24 @@ We report the following single DG result on PACS, with resnet-18 as the backbone
 
 
 ## Quick start: (Generalizing from art, cartoon, sketch to photo domain with ResNet-18)
-1. Install the required packages.
-2. Download PACS dataset.
-3. Execute the following code.
+1. Install the required packages (including HuggingFace `datasets`):
+```
+pip install datasets
+```
+2. Execute the following code. For the PACS task the dataset is now downloaded and
+   cached automatically via HuggingFace `datasets` (`flwrlabs/pacs`, ~191MB on first
+   run, cached under `~/.cache/huggingface`), so no manual download is needed:
 ```
 bash run_main_PACS.sh
 ```
+
+### Data backend
+PACS is loaded through HuggingFace `datasets` by default (`--data_backend=auto`).
+- `--data_backend=hf`: force HuggingFace loading (PACS).
+- `--data_backend=files`: use the original local txt-list / image-folder pipeline
+  (expects images under the paths hardcoded in `data/JigsawLoader.py`).
+
+VLCS and Office-Home still use the local-file pipeline.
 
 ## Change dataset
 In line 266-300 of train.py, we provide 3 different datasets settings (PACS, VLCS, OFFICE-HOME).
