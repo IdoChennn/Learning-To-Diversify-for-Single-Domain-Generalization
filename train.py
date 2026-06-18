@@ -171,6 +171,7 @@ class Trainer:
                             {"class": torch.sum(cls_pred[class_l.size(0):] == class_l.data).item()},
                             class_l.shape[0])
 
+        self.logger.end_epoch()
         del loss, class_loss, logits
 
         self.extractor.eval()
@@ -217,7 +218,7 @@ class Trainer:
         return class_correct
 
     def do_training(self):
-        self.logger = Logger(self.args, update_frequency=30)
+        self.logger = Logger(self.args)
         self.results = {"val": torch.zeros(self.args.epochs), "test": torch.zeros(self.args.epochs)}
         for self.current_epoch in range(self.args.epochs):
             self.logger.new_epoch(self.scheduler.get_lr())
@@ -232,7 +233,7 @@ class Trainer:
         return self.logger
 
     def do_eval(self):
-        self.logger = Logger(self.args, update_frequency=30)
+        self.logger = Logger(self.args)
         self.results = {"val": torch.zeros(self.args.epochs), "test": torch.zeros(self.args.epochs)}
         self.logger.new_epoch(self.scheduler.get_lr())
         self.extractor.eval()
