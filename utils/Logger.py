@@ -36,8 +36,9 @@ class Logger():
         self.loss_stats = {}
         self.total = 0
 
-    def log_test(self, phase, accuracies):
-        print("Accuracies on %s: " % phase + ", ".join(
+    def log_test(self, phase, accuracies, domain=None):
+        label = "%s (%s)" % (phase, domain) if domain is not None else phase
+        print("Accuracies on %s: " % label + ", ".join(
             ["%s : %.2f" % (k, v * 100) for k, v in accuracies.items()]))
 
     def finish(self):

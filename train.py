@@ -184,7 +184,7 @@ class Trainer:
                     class_correct = self.do_test(loader)
 
                     class_acc = float(class_correct) / total
-                    self.logger.log_test('test', {"class": class_acc})
+                    self.logger.log_test('test', {"class": class_acc}, domain=self.args.target[i])
 
                     avg_acc += class_acc
                 avg_acc = avg_acc / len(self.args.target)
@@ -199,7 +199,8 @@ class Trainer:
                     class_correct = self.do_test(loader)
 
                     class_acc = float(class_correct) / total
-                    self.logger.log_test(phase, {"class": class_acc})
+                    domain = self.args.target[0] if phase == 'test' else None
+                    self.logger.log_test(phase, {"class": class_acc}, domain=domain)
                     self.results[phase][self.current_epoch] = class_acc
 
     def do_test(self, loader):
@@ -244,7 +245,8 @@ class Trainer:
                 class_correct = self.do_test(loader)
 
                 class_acc = float(class_correct) / total
-                self.logger.log_test(phase, {"class": class_acc})
+                domain = self.args.target[0] if phase == 'test' else None
+                self.logger.log_test(phase, {"class": class_acc}, domain=domain)
                 self.results[phase][0] = class_acc
 
         val_res = self.results["val"]
