@@ -74,6 +74,10 @@ class Trainer:
         self.extractor = resnet18(classes=args.n_classes).to(device)
         self.convertor = AugNet(1).cuda()
 
+        # Baseline model trained with source samples only (no augmentation,
+        # no single-DG loss functions) for comparison.
+        self.baseline = resnet18(classes=args.n_classes).to(device)
+
         self.source_loader, self.val_loader = data_helper.get_train_dataloader(args, patches=False)
         if len(self.args.target) > 1:
             self.target_loader = data_helper.get_multiple_val_dataloader(args, patches=False)
@@ -88,6 +92,10 @@ class Trainer:
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=int(self.args.epochs *0.8))
 
         self.convertor_opt = torch.optim.SGD(self.convertor.parameters(), lr=self.args.lr_sc)
+
+        # Optimizer / scheduler for the source-only baseline model.
+        self.baseline_optimizer = torch.optim.SGD(self.baseline.parameters(), lr=self.args.learning_rate, nesterov=True, momentum=0.9, weight_decay=0.0005)
+        self.baseline_scheduler = torch.optim.lr_scheduler.StepLR(self.baseline_optimizer, step_size=int(self.args.epochs * 0.8))
 
         self.n_classes = args.n_classes
         self.centroids = 0
@@ -105,6 +113,7 @@ class Trainer:
     def _do_epoch(self, epoch=None):
         criterion = nn.CrossEntropyLoss()
         self.extractor.train()
+        self.baseline.train()
         tran = transforms.Normalize([0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         for it, ((data, _, class_l), _, idx) in enumerate(self.source_loader):
             data, class_l = data.to(self.device), class_l.to(self.device)
@@ -164,32 +173,51 @@ class Trainer:
             self.convertor_opt.zero_grad()
             (dist + self.args.beta * div).backward()
             self.convertor_opt.step()
+
+            # BASELINE: train a separate model on source samples only,
+            # using a plain cross-entropy loss (no augmentation, no single-DG losses).
+            self.baseline_optimizer.zero_grad()
+            base_logits, _ = self.baseline(data)
+            base_loss = criterion(base_logits, class_l)
+            base_loss.backward()
+            self.baseline_optimizer.step()
+            _, base_pred = base_logits.max(dim=1)
+
             self.logger.log(it, len(self.source_loader),
                             {"class": class_loss.item(),
+                             "base": base_loss.item(),
                              "AUG:": torch.sum(cls_pred[:class_l.size(0)] == class_l.data).item() / class_l.shape[0],
                              },
-                            {"class": torch.sum(cls_pred[class_l.size(0):] == class_l.data).item()},
+                            {"class": torch.sum(cls_pred[class_l.size(0):] == class_l.data).item(),
+                             "base": torch.sum(base_pred == class_l.data).item()},
                             class_l.shape[0])
 
         self.logger.end_epoch()
-        del loss, class_loss, logits
+        del loss, class_loss, logits, base_loss, base_logits
 
         self.extractor.eval()
+        self.baseline.eval()
         with torch.no_grad():
             if len(self.args.target) > 1:
                 avg_acc = 0
+                avg_acc_base = 0
                 for i, loader in enumerate(self.target_loader):
                     total = len(loader.dataset)
 
                     class_correct = self.do_test(loader)
+                    class_correct_base = self.do_test(loader, model=self.baseline)
 
                     class_acc = float(class_correct) / total
-                    self.logger.log_test('test', {"class": class_acc}, domain=self.args.target[i])
+                    class_acc_base = float(class_correct_base) / total
+                    self.logger.log_test('test', {"class": class_acc, "base": class_acc_base}, domain=self.args.target[i])
 
                     avg_acc += class_acc
+                    avg_acc_base += class_acc_base
                 avg_acc = avg_acc / len(self.args.target)
-                print(avg_acc)
+                avg_acc_base = avg_acc_base / len(self.args.target)
+                print("avg test acc - aug: %g, baseline: %g" % (avg_acc, avg_acc_base))
                 self.results["test"][self.current_epoch] = avg_acc
+                self.results["test_base"][self.current_epoch] = avg_acc_base
             else:
                 for phase, loader in self.test_loaders.items():
                     if self.args.task == 'HOME' and phase == 'val':
@@ -197,19 +225,24 @@ class Trainer:
                     total = len(loader.dataset)
 
                     class_correct = self.do_test(loader)
+                    class_correct_base = self.do_test(loader, model=self.baseline)
 
                     class_acc = float(class_correct) / total
+                    class_acc_base = float(class_correct_base) / total
                     domain = self.args.target[0] if phase == 'test' else None
-                    self.logger.log_test(phase, {"class": class_acc}, domain=domain)
+                    self.logger.log_test(phase, {"class": class_acc, "base": class_acc_base}, domain=domain)
                     self.results[phase][self.current_epoch] = class_acc
+                    self.results[phase + "_base"][self.current_epoch] = class_acc_base
 
-    def do_test(self, loader):
+    def do_test(self, loader, model=None):
+        if model is None:
+            model = self.extractor
         class_correct = 0
         for it, ((data, nouse, class_l), _, _) in enumerate(loader):
             data, nouse, class_l = data.to(self.device), nouse.to(self.device), class_l.to(self.device)
 
 
-            z = self.extractor(data, train=False)[0]
+            z = model(data, train=False)[0]
 
 
             _, cls_pred = z.max(dim=1)
@@ -220,16 +253,27 @@ class Trainer:
 
     def do_training(self):
         self.logger = Logger(self.args)
-        self.results = {"val": torch.zeros(self.args.epochs), "test": torch.zeros(self.args.epochs)}
+        self.results = {"val": torch.zeros(self.args.epochs), "test": torch.zeros(self.args.epochs),
+                        "val_base": torch.zeros(self.args.epochs), "test_base": torch.zeros(self.args.epochs)}
         for self.current_epoch in range(self.args.epochs):
             self.logger.new_epoch(self.scheduler.get_lr())
             self._do_epoch(self.current_epoch)
             self.scheduler.step()
+            self.baseline_scheduler.step()
         val_res = self.results["val"]
         test_res = self.results["test"]
         idx_best = test_res.argmax()
-        print("Best val %g, corresponding test %g - best test: %g, best test epoch: %g" % (
+        print("[AUG] Best val %g, corresponding test %g - best test: %g, best test epoch: %g" % (
         val_res.max(), test_res[idx_best], test_res.max(), idx_best))
+
+        val_res_base = self.results["val_base"]
+        test_res_base = self.results["test_base"]
+        idx_best_base = test_res_base.argmax()
+        print("[BASELINE] Best val %g, corresponding test %g - best test: %g, best test epoch: %g" % (
+        val_res_base.max(), test_res_base[idx_best_base], test_res_base.max(), idx_best_base))
+
+        print("[COMPARE] best test - aug: %g vs baseline: %g (aug - baseline: %g)" % (
+        test_res.max(), test_res_base.max(), test_res.max() - test_res_base.max()))
         self.logger.finish()
         return self.logger
 
