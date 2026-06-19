@@ -110,6 +110,26 @@ class Trainer:
             self.target_id = None
 
 
+    def _standard_augment(self, data):
+        # Generic, per-sample geometric augmentation (random zoom/crop, translation,
+        # horizontal flip) applied directly on the normalized tensors. Used to build a
+        # count-matched second view for the baseline, so it sees 2N samples per step
+        # just like the augmented model -- controlling for the 2x gradient signal.
+        n, c, h, w = data.shape
+        device = data.device
+        scale = torch.empty(n, device=device).uniform_(self.args.min_scale, self.args.max_scale)
+        flip = torch.where(torch.rand(n, device=device) < self.args.random_horiz_flip,
+                           -torch.ones(n, device=device), torch.ones(n, device=device))
+        tx = (torch.rand(n, device=device) * 2 - 1) * (1 - scale)
+        ty = (torch.rand(n, device=device) * 2 - 1) * (1 - scale)
+        theta = torch.zeros(n, 2, 3, device=device)
+        theta[:, 0, 0] = scale * flip
+        theta[:, 1, 1] = scale
+        theta[:, 0, 2] = tx
+        theta[:, 1, 2] = ty
+        grid = F.affine_grid(theta, data.size(), align_corners=False)
+        return F.grid_sample(data, grid, align_corners=False, padding_mode='reflection')
+
     def _do_epoch(self, epoch=None):
         criterion = nn.CrossEntropyLoss()
         self.extractor.train()
@@ -174,14 +194,20 @@ class Trainer:
             (dist + self.args.beta * div).backward()
             self.convertor_opt.step()
 
-            # BASELINE: train a separate model on source samples only,
-            # using a plain cross-entropy loss (no augmentation, no single-DG losses).
+            # BASELINE: train a separate model on source samples only, with a plain
+            # cross-entropy loss (no learned augmentation, no single-DG losses). To
+            # control for the 2x gradient signal of the augmented model, the baseline
+            # sees a count-matched [generic_aug, original] batch of the same size.
             self.baseline_optimizer.zero_grad()
-            base_logits, _ = self.baseline(data)
-            base_loss = criterion(base_logits, class_l)
+            base_view = self._standard_augment(data)
+            base_input = torch.cat([base_view, data])
+            base_labels = torch.cat([class_l, class_l])
+            base_logits, _ = self.baseline(base_input)
+            base_loss = criterion(base_logits, base_labels)
             base_loss.backward()
             self.baseline_optimizer.step()
             _, base_pred = base_logits.max(dim=1)
+            base_pred = base_pred[class_l.size(0):]
 
             self.logger.log(it, len(self.source_loader),
                             {"class": class_loss.item(),
