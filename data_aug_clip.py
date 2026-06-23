@@ -13,26 +13,27 @@ Method (following the user's specification)
    a set of ``M`` target prompts ``P^t = {p^t_j}`` describing variations expected
    in different target domains (e.g. sketch / cartoon / art styles). ``V`` is the
    CLIP image encoder, ``T`` the CLIP text encoder.
-2. For every source image ``x`` we want augmentations ``{A_j}`` such that the
-   semantic shift incurred by ``x + A_j`` matches the difference between ``p^s``
-   and ``p^t_j``.
-3. We embed the prompts ``q^s = T(p^s)`` and ``q^t_j = T(p^t_j)`` and form a
-   *target image embedding*
+2. For every source image ``x`` we want a SINGLE augmentation ``A`` whose
+   semantic shift jointly reflects the differences between ``p^s`` and every
+   ``p^t_j`` (one augmented image per source image, not one per prompt).
+3. We embed the prompts ``q^s = T(p^s)`` and ``q^t_j = T(p^t_j)`` and form, for
+   each prompt, a *target image embedding*
 
        z*_j = z + (q^t_j - q^s) / ||q^t_j - q^s||_2 ,    where z = V(x).
 
    (We work in the unit-norm CLIP space, so ``z`` is L2-normalized and a tunable
    ``SHIFT_SCALE`` scales the unit text-difference direction.)
-4. We then optimize an additive augmentation ``A_j`` (in pixel space) so that the
-   embedding of the augmented image ``z#_j = V(x + A_j)`` is as close as possible
-   (cosine distance) to ``z*_j``, while staying close to the original embedding:
+4. We optimize a single additive augmentation ``A`` (in pixel space) so that the
+   embedding of the augmented image ``z# = V(x + A)`` is simultaneously close
+   (cosine distance) to all target embeddings ``z*_j``. The loss SUMS the risk
+   over all prompts j, plus an L1 embedding-preservation term:
 
-       L = sum_j  D(z*_j, z#_j)  +  lambda * || z#_j - z ||_1 ,
+       L = sum_j  D(z*_j, z#)  +  lambda * || z# - z ||_1 ,
        D(a, b) = 1 - <a, b> / (||a|| ||b||)   (cosine distance).
 
    The L1 term keeps the augmented embedding near its initial value, preserving
    image content. Only source-domain images are used.
-5. We train a classifier on (original + CLIP-augmented) source images and compare
+5. We train a classifier on the CLIP-augmented source images (only) and compare
    its domain-generalization accuracy on the *other* domains against a baseline
    classifier trained on the pure original source data.
 
@@ -104,11 +105,7 @@ PROMPT_TEMPLATE = "an image in the style of {}"
 
 # Optional extra target prompts (generic nuisance variations) appended to the
 # per-domain style prompts. Set to [] to disable.
-EXTRA_TARGET_PROMPTS = [
-    "a blurry image",
-    "an image taken at night",
-    "an image in heavy fog",
-]
+EXTRA_TARGET_PROMPTS = []
 
 # --- Augmentation-optimization hyper-parameters ---
 N_OPT_STEPS = 30        # gradient steps per image-batch per prompt
@@ -225,46 +222,47 @@ def cosine_distance(a, b):
 
 
 def optimize_augmentation(model, input_res, x01, directions, device):
-    """Find augmentations ``A_j`` for a batch of [0,1] images ``x01``.
+    """Find ONE augmentation ``A`` per image so its CLIP embedding is jointly
+    close to every prompt's shifted target embedding.
 
-    For each of the ``M`` text directions we optimize an additive perturbation so
-    that the augmented image's CLIP embedding matches the shifted target embedding
-    ``z*_j``. Returns a tensor of shape ``(M, N, 3, H, W)`` of augmented [0,1]
-    images (detached).
+    A single additive perturbation ``A`` is optimized for each source image. Its
+    augmented embedding ``z# = V(x + A)`` is pulled towards all ``M`` target
+    embeddings ``z*_j`` at once via a loss summed over the prompts:
+
+        L = sum_j  D(z*_j, z#)  +  lambda * || z# - z ||_1 .
+
+    Returns a tensor of shape ``(N, 3, H, W)`` of augmented [0,1] images (one per
+    source image, detached on CPU).
     """
-    n = x01.size(0)
     with torch.no_grad():
-        z = clip_encode_image(model, x01, input_res)        # (N, D)
-        z_hat = F.normalize(z, dim=-1)
+        z = clip_encode_image(model, x01, input_res)            # (N, D)
+        z_hat = F.normalize(z, dim=-1)                          # (N, D)
+        # Per-prompt shifted target embeddings: (M, N, D), fixed.
+        z_star = F.normalize(
+            z_hat.unsqueeze(0) + SHIFT_SCALE * directions.unsqueeze(1), dim=-1)
 
-    out = []
-    for j in range(directions.size(0)):
-        d_j = directions[j:j + 1]                            # (1, D)
-        z_star = F.normalize(z_hat + SHIFT_SCALE * d_j, dim=-1)  # (N, D), fixed
+    a = torch.zeros_like(x01, requires_grad=True)               # one A per image
+    opt = torch.optim.Adam([a], lr=AUG_LR)
+    for _ in range(N_OPT_STEPS):
+        opt.zero_grad()
+        x_aug = (x01 + a).clamp(0, 1)
+        z_sharp = clip_encode_image(model, x_aug, input_res)
+        z_sharp_n = F.normalize(z_sharp, dim=-1)                # (N, D)
 
-        a = torch.zeros_like(x01, requires_grad=True)
-        opt = torch.optim.Adam([a], lr=AUG_LR)
-        for _ in range(N_OPT_STEPS):
-            opt.zero_grad()
-            x_aug = (x01 + a).clamp(0, 1)
-            z_sharp = clip_encode_image(model, x_aug, input_res)
-            z_sharp_n = F.normalize(z_sharp, dim=-1)
-
-            sim_loss = cosine_distance(z_star, z_sharp_n).mean()
-            # L1 embedding-preservation term: keep z# near the initial z.
-            reg = (z_sharp_n - z_hat).abs().sum(dim=-1).mean()
-            loss = sim_loss + LAMBDA_REG * reg
-            loss.backward()
-            opt.step()
-            with torch.no_grad():
-                a.clamp_(-MAX_AUG_PIXEL, MAX_AUG_PIXEL)
-
+        # Sum the cosine-distance risk over all prompts j (mean over batch).
+        sim = cosine_distance(z_star, z_sharp_n.unsqueeze(0))   # (M, N)
+        sim_loss = sim.sum(dim=0).mean()
+        # L1 embedding-preservation term: keep z# near the initial z.
+        reg = (z_sharp_n - z_hat).abs().sum(dim=-1).mean()
+        loss = sim_loss + LAMBDA_REG * reg
+        loss.backward()
+        opt.step()
         with torch.no_grad():
-            x_aug = (x01 + a).clamp(0, 1)
-        out.append(x_aug.detach().cpu())
+            a.clamp_(-MAX_AUG_PIXEL, MAX_AUG_PIXEL)
 
-    # (M, N, 3, H, W)
-    return torch.stack(out, dim=0)
+    with torch.no_grad():
+        x_aug = (x01 + a).clamp(0, 1)
+    return x_aug.detach().cpu()                                 # (N, 3, H, W)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +305,7 @@ def get_raw_source_dataset(args, domain):
 
 def _config_signature(args, source, target_prompts):
     raw = "|".join([
+        "v2-unified",  # single augmented image per source, loss summed over prompts
         CLIP_MODEL_NAME, args.task, source, str(args.image_size),
         str(SHIFT_SCALE), str(N_OPT_STEPS), str(AUG_LR), str(LAMBDA_REG),
         str(MAX_AUG_PIXEL), str(LIMIT_SOURCE_IMAGES), "::".join(target_prompts),
@@ -320,7 +319,8 @@ def generate_augmented_source(args, source, device):
     Returns ``(orig_u8, labels, aug_u8, target_names)`` where:
       * ``orig_u8``  : (N, 3, H, W) uint8 original source images,
       * ``labels``   : (N,) long labels,
-      * ``aug_u8``   : (M, N, 3, H, W) uint8 CLIP-augmented images,
+      * ``aug_u8``   : (N, 3, H, W) uint8 CLIP-augmented images (one per source
+        image; its embedding jointly targets all M prompts),
       * ``target_names`` : list of M prompt names.
     Augmentations are cached on disk keyed by the config signature.
     """
@@ -353,7 +353,7 @@ def generate_augmented_source(args, source, device):
     n_total = len(dataset)
     for (data, _, class_l) in loader:
         x01 = data.to(device)
-        aug = optimize_augmentation(model, input_res, x01, directions, device)  # (M,B,...)
+        aug = optimize_augmentation(model, input_res, x01, directions, device)  # (B,3,H,W)
         orig_chunks.append((x01.detach().cpu() * 255).round().to(torch.uint8))
         label_chunks.append(class_l.clone())
         aug_chunks.append((aug * 255).round().to(torch.uint8))
@@ -362,7 +362,7 @@ def generate_augmented_source(args, source, device):
 
     orig_u8 = torch.cat(orig_chunks, dim=0)                 # (N,3,H,W)
     labels = torch.cat(label_chunks, dim=0)                 # (N,)
-    aug_u8 = torch.cat(aug_chunks, dim=1)                   # (M,N,3,H,W)
+    aug_u8 = torch.cat(aug_chunks, dim=0)                   # (N,3,H,W)
 
     blob = {'orig': orig_u8, 'labels': labels, 'aug': aug_u8, 'names': target_names}
     torch.save(blob, cache_path)
@@ -452,7 +452,7 @@ def evaluate(model, loader, device):
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
-        for (data, _, class_l) in loader:
+        for ((data, _, class_l), _, _) in loader:
             data, class_l = data.to(device), class_l.to(device)
             logits = model(data, train=False)[0]
             _, pred = logits.max(dim=1)
@@ -466,23 +466,20 @@ def evaluate(model, loader, device):
 # ---------------------------------------------------------------------------
 
 def save_aug_grid(orig_u8, aug_u8, target_names, out_path, n_show=6):
-    """Save a grid: rows = sample images, cols = [original, aug per prompt]."""
-    m = aug_u8.size(0)
+    """Save a grid: rows = sample images, cols = [original, CLIP-augmented]."""
     n_show = min(n_show, orig_u8.size(0))
-    cols = 1 + m
-    fig, axes = plt.subplots(n_show, cols, figsize=(2.0 * cols, 2.0 * n_show))
+    fig, axes = plt.subplots(n_show, 2, figsize=(4.0, 2.0 * n_show))
     if n_show == 1:
         axes = axes.reshape(1, -1)
+    aug_title = "augmented (-> %s)" % ", ".join(target_names)
     for r in range(n_show):
         axes[r, 0].imshow(orig_u8[r].permute(1, 2, 0).numpy())
         axes[r, 0].set_axis_off()
+        axes[r, 1].imshow(aug_u8[r].permute(1, 2, 0).numpy())
+        axes[r, 1].set_axis_off()
         if r == 0:
             axes[r, 0].set_title("original", fontsize=9)
-        for c in range(m):
-            axes[r, c + 1].imshow(aug_u8[c, r].permute(1, 2, 0).numpy())
-            axes[r, c + 1].set_axis_off()
-            if r == 0:
-                axes[r, c + 1].set_title(target_names[c], fontsize=9)
+            axes[r, 1].set_title(aug_title, fontsize=7)
     plt.tight_layout()
     plt.savefig(out_path, dpi=130)
     plt.close()
@@ -543,20 +540,18 @@ def main():
     # --- Steps 1-4: generate CLIP-guided augmentations of the source domain. ---
     print("\n==== Generating CLIP-guided augmentations for source '%s' ====" % source)
     orig_u8, labels, aug_u8, target_names = generate_augmented_source(args, source, device)
-    print("Original images: %s | Augmented: %s (M=%d prompts)"
-          % (tuple(orig_u8.shape), tuple(aug_u8.shape), aug_u8.size(0)))
+    print("Original images: %s | Augmented: %s (loss summed over %d prompts: %s)"
+          % (tuple(orig_u8.shape), tuple(aug_u8.shape), len(target_names),
+             ", ".join(target_names)))
 
     save_aug_grid(orig_u8, aug_u8, target_names,
                   os.path.join(OUTPUT_DIR, "aug_preview_%s.png" % source))
 
     # Build training tensors.
-    #   Augmented model: original + every augmented copy.
+    #   Augmented model: one CLIP-augmented image per source image (no originals).
     #   Baseline model : original only.
-    m, n = aug_u8.shape[0], aug_u8.shape[1]
-    aug_flat = aug_u8.reshape(m * n, *aug_u8.shape[2:])
-    aug_labels = labels.repeat(m)
-    aug_images = torch.cat([orig_u8, aug_flat], dim=0)
-    aug_all_labels = torch.cat([labels, aug_labels], dim=0)
+    aug_images = aug_u8
+    aug_all_labels = labels
 
     # --- Step 5: train both classifiers. ---
     print("\n==== Training CLIP-augmented classifier ====")
