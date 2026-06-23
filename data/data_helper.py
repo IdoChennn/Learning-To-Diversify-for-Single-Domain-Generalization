@@ -163,6 +163,19 @@ def _get_multiple_val_dataloader_hf(args):
     return loaders
 
 
+def _get_source_test_dataloader_hf(args):
+    """Held-out source-domain split for HF (no predefined test_kfold txt)."""
+    img_tr = get_val_transformer(args)
+    split, idx_by_domain = _load_hf_pacs()
+    datasets = []
+    for dname in args.source:
+        idx = _hf_domain_indices(idx_by_domain, dname)
+        _, test_idx = _hf_split_train_val(idx, args.val_size, args.seed)
+        datasets.append(HFImageDataset(split, test_idx, img_tr))
+    dataset = ConcatDataset(datasets)
+    return DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True, drop_last=False)
+
+
 def get_train_dataloader(args, patches):
     if use_hf_backend(args):
         return _get_train_dataloader_hf(args)
@@ -231,6 +244,26 @@ def get_val_dataloader(args, patches=False):
     dataset = ConcatDataset([val_dataset])
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True, drop_last=False)
     return loader
+
+def get_source_test_dataloader(args, patches=False):
+    if use_hf_backend(args):
+        return _get_source_test_dataloader_hf(args)
+    datasets = []
+    for dname in args.source:
+        if args.task == 'PACS':
+            names, labels = _dataset_info(join(dirname(__file__), 'correct_txt_lists', '%s_test_kfold.txt' % dname))
+        elif args.task == 'VLCS':
+            names, labels = _dataset_info(join(dirname(__file__), 'correct_txt_lists', '%s_test.txt' % dname))
+        elif args.task == 'HOME':
+            names, labels = _dataset_info(join(dirname(__file__), 'correct_txt_lists', '%s_full.txt' % dname))
+        else:
+            raise NotImplementedError('SOURCE TEST DATA LOADER NOT IMPLEMENTED.')
+        img_tr = get_val_transformer(args)
+        datasets.append(
+            JigsawTestNewDataset(args, names, labels, patches=patches, img_transformer=img_tr, jig_classes=30))
+    dataset = ConcatDataset(datasets)
+    return DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True, drop_last=False)
+
 
 def get_multiple_val_dataloader(args, patches=False):
     if use_hf_backend(args):

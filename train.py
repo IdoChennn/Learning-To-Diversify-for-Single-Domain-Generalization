@@ -79,6 +79,7 @@ class Trainer:
         self.baseline = resnet18(classes=args.n_classes).to(device)
 
         self.source_loader, self.val_loader = data_helper.get_train_dataloader(args, patches=False)
+        self.source_test_loader = data_helper.get_source_test_dataloader(args, patches=False)
         if len(self.args.target) > 1:
             self.target_loader = data_helper.get_multiple_val_dataloader(args, patches=False)
         else:
@@ -224,6 +225,17 @@ class Trainer:
         self.extractor.eval()
         self.baseline.eval()
         with torch.no_grad():
+            source_total = len(self.source_test_loader.dataset)
+            source_correct = self.do_test(self.source_test_loader)
+            source_correct_base = self.do_test(self.source_test_loader, model=self.baseline)
+            source_acc = float(source_correct) / source_total
+            source_acc_base = float(source_correct_base) / source_total
+            source_domain = self.args.source[0] if len(self.args.source) == 1 else None
+            self.logger.log_test('source test', {"class": source_acc, "base": source_acc_base},
+                                 domain=source_domain)
+            self.results["source_test"][self.current_epoch] = source_acc
+            self.results["source_test_base"][self.current_epoch] = source_acc_base
+
             if len(self.args.target) > 1:
                 avg_acc = 0
                 avg_acc_base = 0
@@ -280,9 +292,11 @@ class Trainer:
     def do_training(self):
         self.logger = Logger(self.args)
         self.results = {"val": torch.zeros(self.args.epochs), "test": torch.zeros(self.args.epochs),
-                        "val_base": torch.zeros(self.args.epochs), "test_base": torch.zeros(self.args.epochs)}
+                        "val_base": torch.zeros(self.args.epochs), "test_base": torch.zeros(self.args.epochs),
+                        "source_test": torch.zeros(self.args.epochs),
+                        "source_test_base": torch.zeros(self.args.epochs)}
         for self.current_epoch in range(self.args.epochs):
-            self.logger.new_epoch(self.scheduler.get_lr())
+            self.logger.new_epoch(self.scheduler.get_last_lr())
             self._do_epoch(self.current_epoch)
             self.scheduler.step()
             self.baseline_scheduler.step()
@@ -300,13 +314,20 @@ class Trainer:
 
         print("[COMPARE] best test - aug: %g vs baseline: %g (aug - baseline: %g)" % (
         test_res.max(), test_res_base.max(), test_res.max() - test_res_base.max()))
+
+        source_test_res = self.results["source_test"]
+        source_test_res_base = self.results["source_test_base"]
+        idx_best_source = source_test_res.argmax()
+        print("[SOURCE] best source test %g (epoch %g), baseline %g (epoch %g)" % (
+            source_test_res.max(), idx_best_source,
+            source_test_res_base.max(), source_test_res_base.argmax()))
         self.logger.finish()
         return self.logger
 
     def do_eval(self):
         self.logger = Logger(self.args)
         self.results = {"val": torch.zeros(self.args.epochs), "test": torch.zeros(self.args.epochs)}
-        self.logger.new_epoch(self.scheduler.get_lr())
+        self.logger.new_epoch(self.scheduler.get_last_lr())
         self.extractor.eval()
         with torch.no_grad():
             for phase, loader in self.test_loaders.items():
