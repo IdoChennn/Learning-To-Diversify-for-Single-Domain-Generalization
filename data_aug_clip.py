@@ -9,10 +9,10 @@ driven entirely by CLIP text prompts.
 
 Method (following the user's specification)
 -------------------------------------------
-1. A generic source prompt ``p^s`` (e.g. "an image in the style of a photo") and
-   a set of ``M`` target prompts ``P^t = {p^t_j}`` describing variations expected
-   in different target domains (e.g. sketch / cartoon / art styles). ``V`` is the
-   CLIP image encoder, ``T`` the CLIP text encoder.
+1. A source prompt ``p^s`` and target prompts ``p^t_j`` built from domain style
+   and class label, e.g. ``"photo style image of dog"`` and
+   ``"sketch style image of dog"``. ``V`` is the CLIP image encoder, ``T`` the
+   text encoder.
 2. For every source image ``x`` we want a SINGLE augmentation ``A`` whose
    semantic shift jointly reflects the differences between ``p^s`` and every
    ``p^t_j`` (one augmented image per source image, not one per prompt).
@@ -71,48 +71,43 @@ from train import get_args
 
 # Domains available per task.
 TASK_DOMAINS = {
-    'PACS': ["art_painting", "cartoon", "photo", "sketch"],
+    'PACS': ["art_painting", "sketch"],
     'VLCS': ["CALTECH", "LABELME", "PASCAL", "SUN"],
     'HOME': ['art', 'clip', 'product', 'real'],
 }
 
 # The single source domain we augment and train on.
-SOURCE_DOMAIN = 'photo'
+SOURCE_DOMAIN = 'sketch'
 
 # CLIP backbone used both as image encoder V and text encoder T.
 CLIP_MODEL_NAME = "ViT-B/32"
 
-# Per-domain *style phrases* plugged into PROMPT_TEMPLATE to build p^s / p^t_j.
+# Per-domain names plugged into PROMPT_TEMPLATE as {domain}.
 STYLE_PHRASES = {
     # PACS
-    'photo': 'a photo',
-    'art_painting': 'an art painting',
-    'cartoon': 'a cartoon',
-    'sketch': 'a sketch',
+    'photo': 'photo',
+    'art_painting': 'art painting',
+    'cartoon': 'cartoon',
+    'sketch': 'sketch',
     # Office-Home
-    'art': 'an artistic painting',
-    'clip': 'a clipart image',
-    'product': 'a product image on a white background',
-    'real': 'a real-world photo',
-    # VLCS domains are datasets rather than visual styles; we fall back to a
-    # neutral phrasing so the direction is at least well-defined.
-    'CALTECH': 'a clean object-centric photo',
-    'LABELME': 'a cluttered scene photo',
-    'PASCAL': 'a natural scene photo',
-    'SUN': 'a wide-angle scene photo',
+    'art': 'art',
+    'clip': 'clipart',
+    'product': 'product',
+    'real': 'real-world',
+    # VLCS
+    'CALTECH': 'CALTECH',
+    'LABELME': 'LABELME',
+    'PASCAL': 'PASCAL',
+    'SUN': 'SUN',
 }
-PROMPT_TEMPLATE = "an image in the style of {}"
-
-# Optional extra target prompts (generic nuisance variations) appended to the
-# per-domain style prompts. Set to [] to disable.
-EXTRA_TARGET_PROMPTS = []
+PROMPT_TEMPLATE = "{domain} style image of {label}"
 
 # --- Augmentation-optimization hyper-parameters ---
 N_OPT_STEPS = 30        # gradient steps per image-batch per prompt
 AUG_LR = 0.02           # Adam lr for the additive perturbation A_j
-LAMBDA_REG = 0.2        # weight on the L1 embedding-preservation term
+LAMBDA_REG = 0.3        # weight on the L1 embedding-preservation term
 SHIFT_SCALE = 1.0       # magnitude of the unit text-difference shift
-MAX_AUG_PIXEL = 0.25    # clamp |A_j| to this (in [0,1] pixel units) to keep content
+MAX_AUG_PIXEL = 0.5    # clamp |A_j| to this (in [0,1] pixel units) to keep content
 GEN_BATCH_SIZE = 32     # batch size while generating augmentations
 
 # Cap the number of source images that get augmented (None = all). Useful for
@@ -172,42 +167,53 @@ def clip_encode_image(model, x01, input_res):
     return model.encode_image(x)
 
 
-def build_prompts(task, source_domain):
-    """Return ``(source_prompt, target_prompts, target_names)``.
+def format_prompt(domain, label_name):
+    """Build a CLIP text prompt for ``domain`` and object class ``label_name``."""
+    domain_phrase = STYLE_PHRASES.get(domain, domain.replace('_', ' '))
+    return PROMPT_TEMPLATE.format(domain=domain_phrase, label=label_name)
 
-    Target prompts = style prompts for every *other* domain of the task, plus any
-    EXTRA_TARGET_PROMPTS.
+
+def get_target_domains(task, source_domain):
+    """Return target domain names (all task domains except the source)."""
+    return [d for d in TASK_DOMAINS[task] if d != source_domain]
+
+
+def precompute_text_directions(clip_mod, model, source_domain, target_domains,
+                                 class_names, device):
+    """Precompute unit text-difference directions for every (target, class) pair.
+
+    For class ``c`` and target domain ``j``:
+
+        d_{j,c} = normalize( T(p^t_{j,c}) - T(p^s_c) )
+
+    where ``p^s_c = format_prompt(source, label_c)`` and
+    ``p^t_{j,c} = format_prompt(target_j, label_c)``.
+
+    Returns a tensor of shape ``(M, C, D)`` where M = len(target_domains),
+    C = len(class_names).
     """
-    def style_prompt(domain):
-        phrase = STYLE_PHRASES.get(domain, domain.replace('_', ' '))
-        return PROMPT_TEMPLATE.format(phrase)
+    c = len(class_names)
+    src_prompts = [format_prompt(source_domain, class_names[i]) for i in range(c)]
+    tgt_prompts = []
+    for td in target_domains:
+        for i in range(c):
+            tgt_prompts.append(format_prompt(td, class_names[i]))
 
-    source_prompt = style_prompt(source_domain)
-    target_prompts, target_names = [], []
-    for d in TASK_DOMAINS[task]:
-        if d == source_domain:
-            continue
-        target_prompts.append(style_prompt(d))
-        target_names.append(d)
-    for i, p in enumerate(EXTRA_TARGET_PROMPTS):
-        target_prompts.append(p)
-        target_names.append("extra%d" % i)
-    return source_prompt, target_prompts, target_names
-
-
-def text_directions(clip_mod, model, source_prompt, target_prompts, device):
-    """Compute unit text-difference directions  d_j = (q^t_j - q^s)/||.||_2.
-
-    Returns a tensor of shape ``(M, D)``.
-    """
-    tokens = clip_mod.tokenize([source_prompt] + list(target_prompts)).to(device)
     with torch.no_grad():
-        feats = model.encode_text(tokens).float()
-    q_s = feats[0:1]                 # (1, D)
-    q_t = feats[1:]                  # (M, D)
-    d = q_t - q_s                    # (M, D)
-    d = d / d.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        q_s = model.encode_text(clip_mod.tokenize(src_prompts).to(device)).float()
+        q_t = model.encode_text(clip_mod.tokenize(tgt_prompts).to(device)).float()
+        q_t = q_t.view(len(target_domains), c, -1)
+        d = q_t - q_s.unsqueeze(0)
+        d = d / d.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     return d
+
+
+def batch_text_directions(directions_mc, labels):
+    """Index precomputed ``(M, C, D)`` directions by batch labels ``(N,)``.
+
+    Returns ``(M, N, D)``.
+    """
+    return directions_mc[:, labels.long(), :]
 
 
 # ---------------------------------------------------------------------------
@@ -225,21 +231,18 @@ def optimize_augmentation(model, input_res, x01, directions, device):
     """Find ONE augmentation ``A`` per image so its CLIP embedding is jointly
     close to every prompt's shifted target embedding.
 
-    A single additive perturbation ``A`` is optimized for each source image. Its
-    augmented embedding ``z# = V(x + A)`` is pulled towards all ``M`` target
-    embeddings ``z*_j`` at once via a loss summed over the prompts:
+    ``directions`` has shape ``(M, N, D)``: per-image text shift directions
+    (one direction per target prompt and per batch image, derived from that
+    image's class label).
 
-        L = sum_j  D(z*_j, z#)  +  lambda * || z# - z ||_1 .
-
-    Returns a tensor of shape ``(N, 3, H, W)`` of augmented [0,1] images (one per
-    source image, detached on CPU).
+    Returns a tensor of shape ``(N, 3, H, W)`` of augmented [0,1] images.
     """
     with torch.no_grad():
         z = clip_encode_image(model, x01, input_res)            # (N, D)
         z_hat = F.normalize(z, dim=-1)                          # (N, D)
-        # Per-prompt shifted target embeddings: (M, N, D), fixed.
+        # Per-prompt, per-image shifted target embeddings: (M, N, D), fixed.
         z_star = F.normalize(
-            z_hat.unsqueeze(0) + SHIFT_SCALE * directions.unsqueeze(1), dim=-1)
+            z_hat.unsqueeze(0) + SHIFT_SCALE * directions, dim=-1)
 
     a = torch.zeros_like(x01, requires_grad=True)               # one A per image
     opt = torch.optim.Adam([a], lr=AUG_LR)
@@ -303,12 +306,13 @@ def get_raw_source_dataset(args, domain):
                                 patches=False, jig_classes=30)
 
 
-def _config_signature(args, source, target_prompts):
+def _config_signature(args, source, target_domains, class_names):
     raw = "|".join([
-        "v2-unified",  # single augmented image per source, loss summed over prompts
-        CLIP_MODEL_NAME, args.task, source, str(args.image_size),
+        "v3-label-prompts",
+        PROMPT_TEMPLATE, CLIP_MODEL_NAME, args.task, source, str(args.image_size),
         str(SHIFT_SCALE), str(N_OPT_STEPS), str(AUG_LR), str(LAMBDA_REG),
-        str(MAX_AUG_PIXEL), str(LIMIT_SOURCE_IMAGES), "::".join(target_prompts),
+        str(MAX_AUG_PIXEL), str(LIMIT_SOURCE_IMAGES),
+        "::".join(target_domains), "::".join(class_names),
     ])
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
@@ -320,26 +324,31 @@ def generate_augmented_source(args, source, device):
       * ``orig_u8``  : (N, 3, H, W) uint8 original source images,
       * ``labels``   : (N,) long labels,
       * ``aug_u8``   : (N, 3, H, W) uint8 CLIP-augmented images (one per source
-        image; its embedding jointly targets all M prompts),
-      * ``target_names`` : list of M prompt names.
+        image; prompts include both domain style and class label),
+      * ``target_names`` : list of M target domain names.
     Augmentations are cached on disk keyed by the config signature.
     """
-    source_prompt, target_prompts, target_names = build_prompts(args.task, source)
+    class_names = get_class_names(args)
+    if class_names is None:
+        class_names = [str(i) for i in range(args.n_classes)]
+    target_domains = get_target_domains(args.task, source)
 
     os.makedirs(CACHE_DIR, exist_ok=True)
-    sig = _config_signature(args, source, target_prompts)
+    sig = _config_signature(args, source, target_domains, class_names)
     cache_path = os.path.join(CACHE_DIR, "aug_%s_%s.pt" % (source, sig))
     if os.path.exists(cache_path):
         print("Loading cached augmentations: %s" % cache_path)
         blob = torch.load(cache_path, map_location='cpu')
         return blob['orig'], blob['labels'], blob['aug'], blob['names']
 
-    print("Source prompt p^s : %s" % source_prompt)
-    for n, p in zip(target_names, target_prompts):
-        print("Target prompt [%s] : %s" % (n, p))
+    print("Prompt template: %s" % PROMPT_TEMPLATE)
+    print("Example source p^s : %s" % format_prompt(source, class_names[0]))
+    for d in target_domains:
+        print("Example target [%s] : %s" % (d, format_prompt(d, class_names[0])))
 
     clip_mod, model, input_res = load_clip(device)
-    directions = text_directions(clip_mod, model, source_prompt, target_prompts, device)
+    directions_mc = precompute_text_directions(
+        clip_mod, model, source, target_domains, class_names, device)
 
     dataset = get_raw_source_dataset(args, source)
     if LIMIT_SOURCE_IMAGES is not None and len(dataset) > LIMIT_SOURCE_IMAGES:
@@ -353,7 +362,9 @@ def generate_augmented_source(args, source, device):
     n_total = len(dataset)
     for (data, _, class_l) in loader:
         x01 = data.to(device)
-        aug = optimize_augmentation(model, input_res, x01, directions, device)  # (B,3,H,W)
+        labels_dev = class_l.to(device)
+        directions = batch_text_directions(directions_mc, labels_dev)
+        aug = optimize_augmentation(model, input_res, x01, directions, device)
         orig_chunks.append((x01.detach().cpu() * 255).round().to(torch.uint8))
         label_chunks.append(class_l.clone())
         aug_chunks.append((aug * 255).round().to(torch.uint8))
@@ -364,14 +375,14 @@ def generate_augmented_source(args, source, device):
     labels = torch.cat(label_chunks, dim=0)                 # (N,)
     aug_u8 = torch.cat(aug_chunks, dim=0)                   # (N,3,H,W)
 
-    blob = {'orig': orig_u8, 'labels': labels, 'aug': aug_u8, 'names': target_names}
+    blob = {'orig': orig_u8, 'labels': labels, 'aug': aug_u8, 'names': target_domains}
     torch.save(blob, cache_path)
     print("Saved augmentations to %s" % cache_path)
 
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return orig_u8, labels, aug_u8, target_names
+    return orig_u8, labels, aug_u8, target_domains
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +472,64 @@ def evaluate(model, loader, device):
     return float(correct) / max(total, 1)
 
 
+def evaluate_pair(model_aug, model_base, loader, device):
+    """Evaluate both models on the same loader in a single pass.
+
+    Returns ``(acc_aug, acc_base, aug_win, base_win)`` where:
+      * ``aug_win``  : samples the augmented model got right but baseline wrong,
+      * ``base_win`` : samples the baseline got right but augmented wrong.
+    Each sample is a tuple ``(img_norm_cpu, true_label, pred_aug, pred_base)``;
+    ``img_norm_cpu`` is the ImageNet-normalized input tensor.
+    """
+    model_aug.eval()
+    model_base.eval()
+    correct_a = correct_b = total = 0
+    aug_win, base_win = [], []
+    with torch.no_grad():
+        for ((data, _, class_l), _, _) in loader:
+            data, class_l = data.to(device), class_l.to(device)
+            pred_a = model_aug(data, train=False)[0].argmax(dim=1)
+            pred_b = model_base(data, train=False)[0].argmax(dim=1)
+            ca = pred_a == class_l
+            cb = pred_b == class_l
+            correct_a += ca.sum().item()
+            correct_b += cb.sum().item()
+            total += class_l.size(0)
+            for i in range(data.size(0)):
+                if ca[i] and not cb[i]:
+                    aug_win.append((data[i].cpu(), int(class_l[i]),
+                                    int(pred_a[i]), int(pred_b[i])))
+                elif cb[i] and not ca[i]:
+                    base_win.append((data[i].cpu(), int(class_l[i]),
+                                     int(pred_a[i]), int(pred_b[i])))
+    return (float(correct_a) / max(total, 1), float(correct_b) / max(total, 1),
+            aug_win, base_win)
+
+
+def get_class_names(args):
+    """Best-effort list of class names; falls back to None (use indices)."""
+    try:
+        if data_helper.use_hf_backend(args):
+            split, _ = data_helper._load_hf_pacs()
+            feat = split.features.get('label')
+            if hasattr(feat, 'names'):
+                return list(feat.names)
+    except Exception:
+        pass
+    if args.task == 'PACS':
+        # flwrlabs/pacs alphabetical label order.
+        return ['dog', 'elephant', 'giraffe', 'guitar', 'horse', 'house', 'person']
+    return None
+
+
+def _denorm_to_uint8(img_norm):
+    """Undo ImageNet normalization -> uint8 [0,255] image for display."""
+    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+    x = (img_norm * std + mean).clamp(0, 1)
+    return (x * 255).round().to(torch.uint8)
+
+
 # ---------------------------------------------------------------------------
 # Visualization helpers.
 # ---------------------------------------------------------------------------
@@ -484,6 +553,42 @@ def save_aug_grid(orig_u8, aug_u8, target_names, out_path, n_show=6):
     plt.savefig(out_path, dpi=130)
     plt.close()
     print("Saved augmentation preview: %s" % out_path)
+
+
+def save_disagreement_grid(samples, class_names, title, out_path, cols=6):
+    """Save a grid of ALL disagreement samples with true / aug / base labels.
+
+    ``samples`` is a list of ``(img_norm, true_label, pred_aug, pred_base)``.
+    Every sample is displayed (no subsampling); the grid grows as many rows as
+    needed to fit ``len(samples)`` images.
+    """
+    if len(samples) == 0:
+        print("  (no samples for: %s)" % title)
+        return
+
+    def name(idx):
+        if class_names is not None and 0 <= idx < len(class_names):
+            return class_names[idx]
+        return str(idx)
+
+    n = len(samples)
+    cols = min(cols, n)
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(3.0 * cols, 3.3 * rows),
+                             squeeze=False)
+    for k in range(rows * cols):
+        ax = axes[k // cols][k % cols]
+        ax.set_axis_off()
+        if k < n:
+            img, true_l, pa, pb = samples[k]
+            ax.imshow(_denorm_to_uint8(img).permute(1, 2, 0).numpy())
+            ax.set_title("true: %s\naug: %s | base: %s"
+                         % (name(true_l), name(pa), name(pb)), fontsize=8)
+    fig.suptitle("%s  (all %d)" % (title, n), fontsize=11)
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.savefig(out_path, dpi=140)
+    plt.close()
+    print("  Saved %d samples: %s" % (n, out_path))
 
 
 def plot_accuracy_comparison(source, results_aug, results_base, out_path):
@@ -563,14 +668,24 @@ def main():
 
     # --- Evaluate on every other domain (and source test for reference). ---
     print("\n==== Evaluating domain-generalization performance ====")
+    class_names = get_class_names(args)
     results_aug, results_base = {}, {}
     for d in targets:
         loader = get_eval_loader(args, d)
-        a = evaluate(model_aug, loader, device)
-        b = evaluate(model_base, loader, device)
+        a, b, aug_win, base_win = evaluate_pair(model_aug, model_base, loader, device)
         results_aug[d], results_base[d] = a, b
         print("  target %-14s  augmented = %.2f%%   baseline = %.2f%%   (%+.2f)"
               % (d, 100 * a, 100 * b, 100 * (a - b)))
+        print("    disagreements: aug-correct/base-wrong = %d, base-correct/aug-wrong = %d"
+              % (len(aug_win), len(base_win)))
+        save_disagreement_grid(
+            aug_win, class_names,
+            "%s: augmented CORRECT, baseline WRONG" % d.capitalize(),
+            os.path.join(OUTPUT_DIR, "disagree_aug_correct_%s_to_%s.png" % (source, d)))
+        save_disagreement_grid(
+            base_win, class_names,
+            "%s: baseline CORRECT, augmented WRONG" % d.capitalize(),
+            os.path.join(OUTPUT_DIR, "disagree_base_correct_%s_to_%s.png" % (source, d)))
 
     plot_accuracy_comparison(source, results_aug, results_base,
                              os.path.join(OUTPUT_DIR, "dg_comparison_%s.png" % source))
