@@ -2,11 +2,13 @@
 data/
 DeepCore/
 checkpoints/
+data_cifar/
 
 # Python cache files
 __pycache__/
 *.pyc
 *.pyo
+
 
 # Virtual environments
 .venv/

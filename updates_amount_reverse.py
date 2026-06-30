@@ -63,6 +63,12 @@ SOURCE_DOMAIN = 'photo'
 # source; otherwise a list of domain names to restrict to.
 TARGET_DOMAINS = None
 
+# When True, also fine-tune on the SOURCE domain itself (source == target). This
+# gives an extra "same-domain" reference: how much the clean vs poisoned-source
+# models move when they keep training on the very domain they were trained on,
+# rather than transferring to an unseen clean domain.
+INCLUDE_SOURCE_AS_TARGET = True
+
 # Training length (epochs). Fall back to args.epochs if these are None.
 SOURCE_EPOCHS = 20
 TARGET_EPOCHS = 20
@@ -628,6 +634,10 @@ def setup_args():
         targets = [d for d in TARGET_DOMAINS if d in domains and d != src]
     else:
         targets = [d for d in domains if d != src]
+    # Optionally prepend the source domain as a same-domain (source == target)
+    # reference point so we get one extra results figure for it.
+    if INCLUDE_SOURCE_AS_TARGET and src not in targets:
+        targets = [src] + targets
     if not targets:
         raise ValueError(
             "No valid target domains for source '%s' in task %s. "
